@@ -526,6 +526,13 @@ jobs:
           else
             LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
           fi
+          # Replace placeholders with GitHub vars
+          sed -i \
+          -e "s|__GCS_BUCKET__|${{ vars.BUCKET_NAME }}|g" \
+          -e "s|__BQ_PROJECT__|${{ vars.GCP_PROJECT_ID }}|g" \
+          -e "s|__BQ_DATASET__|iam_raw_${BRANCH}|g" \
+          "$LOCAL_VARS_PATH"
+
 
           # Sanity
           : "${COMPOSER_REGION:?COMPOSER_REGION not set}"
