@@ -1,0 +1,638 @@
+name: Flight Booking CICD
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------
+  # 1) Create bucket (idempotent) and seed top-level folders
+  # -------------------------------------------------------------------
+  Bucket-Create-And-Seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Authenticate to GCP with your SA key JSON secret
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Install gcloud/gsutil .
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Create bucket (if needed) and folders
+        env:
+          BUCKET_NAME: ${{ vars.BUCKET_NAME }}   # bare name, e.g. my-unique-bucket (NO gs://, NO slashes)
+          LOCATION: ${{ vars.BUCKET_LOCATION || 'us-central1' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${BUCKET_NAME}" ]]; then
+            echo "ERROR: BUCKET_NAME repo variable is required."
+            exit 1
+          fi
+          if [[ "${BUCKET_NAME}" == *"/"* ]]; then
+            echo "ERROR: BUCKET_NAME must be a bare name (no slashes). Given: '${BUCKET_NAME}'"
+            exit 1
+          fi
+
+          # Create the bucket if it doesn't exist (idempotent)
+          if ! gsutil ls -b "gs://${BUCKET_NAME}" >/dev/null 2>&1; then
+            echo "Creating bucket gs://${BUCKET_NAME} in ${LOCATION}"
+            gsutil mb -l "${LOCATION}" "gs://${BUCKET_NAME}"
+            # Optional hardening:
+            gsutil uniformbucketlevelaccess set on "gs://${BUCKET_NAME}"
+            gsutil pap set enforced "gs://${BUCKET_NAME}"   # public access prevention
+          else
+            echo "Bucket gs://${BUCKET_NAME} already exists"
+          fi
+
+          # Create 5 top-level prefixes if they don't already exist
+          FOLDERS=("data" "output" "source-dev" "source-prod" "spark-job" "metadata")
+          for dir in "${FOLDERS[@]}"; do
+            if ! gsutil ls -d "gs://${BUCKET_NAME}/${dir}/" >/dev/null 2>&1; then
+              echo "Creating prefix gs://${BUCKET_NAME}/${dir}/ (via placeholder)"
+              gsutil -h "Content-Type:text/plain" cp /dev/null "gs://${BUCKET_NAME}/${dir}/.gcskeep"
+            else
+              echo "Prefix gs://${BUCKET_NAME}/${dir}/ already exists"
+            fi
+          done
+  
+
+  # -------------------------------------------------------------------
+  # 2) Pub/Sub Publisher and Subscriber (Dataflow to GCS)
+  # -------------------------------------------------------------------
+  # --- 1) Create topic/subscription and run producer ---------------------
+  PubSub-Pipeline:
+    needs: [Bucket-Create-And-Seed]
+    runs-on: ubuntu-latest
+
+    # Expose the created subscription id to downstream jobs
+    outputs:
+      PUBSUB_SUBSCRIPTION_ID: ${{ steps.pubsub.outputs.subscription_id }}
+      PUBSUB_SUBSCRIPTION_FULL: ${{ steps.pubsub.outputs.subscription_full }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Resolve/create Pub/Sub topic & subscription (idempotent)
+        id: pubsub
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          TOPIC_ID: ${{ vars.TOPIC_ID }}
+          # Optional; if empty we'll auto-name: <topic>-<branch>-sub
+          SUBSCRIPTION_ID_INPUT: ${{ vars.PUBSUB_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+
+          : "${PROJECT_ID:?PROJECT_ID not set}"
+          : "${TOPIC_ID:?TOPIC_ID not set}"
+
+          gcloud config set project "${PROJECT_ID}"
+
+          BRANCH="${GITHUB_REF_NAME:-manual}"
+          SUB="${SUBSCRIPTION_ID_INPUT:-${TOPIC_ID}-${BRANCH}-sub}"
+
+          echo "Project: ${PROJECT_ID}"
+          echo "Topic:   ${TOPIC_ID}"
+          echo "Sub:     ${SUB}"
+
+          # Ensure topic exists
+          gcloud pubsub topics describe "${TOPIC_ID}" >/dev/null 2>&1 \
+            || gcloud pubsub topics create "${TOPIC_ID}"
+
+          # Auto-heal orphaned subs (_deleted-topic_) and ensure sub points to the right topic
+          if gcloud pubsub subscriptions describe "${SUB}" >/dev/null 2>&1; then
+            ACTUAL_TOPIC="$(gcloud pubsub subscriptions describe "${SUB}" --format='value(topic)')"
+            if [[ "${ACTUAL_TOPIC}" == "_deleted-topic_" || "${ACTUAL_TOPIC}" != "projects/${PROJECT_ID}/topics/${TOPIC_ID}" ]]; then
+              echo "Subscription ${SUB} is orphaned (topic=${ACTUAL_TOPIC}). Recreating..."
+              gcloud pubsub subscriptions delete "${SUB}" || true
+              gcloud pubsub subscriptions create "${SUB}" --topic="${TOPIC_ID}" --ack-deadline=60
+            fi
+          else
+            gcloud pubsub subscriptions create "${SUB}" --topic="${TOPIC_ID}" --ack-deadline=60
+          fi
+
+          FULL_SUB="projects/${PROJECT_ID}/subscriptions/${SUB}"
+          echo "PUBSUB_SUBSCRIPTION_ID=${SUB}"        >> "$GITHUB_ENV"
+          echo "PUBSUB_SUBSCRIPTION_FULL=${FULL_SUB}" >> "$GITHUB_ENV"
+          echo "subscription_id=${SUB}"               >> "$GITHUB_OUTPUT"
+          echo "subscription_full=${FULL_SUB}"        >> "$GITHUB_OUTPUT"
+
+
+      - name: Publish messages using producer.py
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          TOPIC_ID: ${{ vars.TOPIC_ID }}
+        run: |
+          set -euo pipefail
+          gcloud config set project "${PROJECT_ID}"
+          python3 -m pip install --upgrade pip google-cloud-pubsub
+          # Make sure producer can read envs: PROJECT_ID, TOPIC_ID
+          python3 producer.py
+          echo "Verifying backlog on sub..."
+          SUB="${{ steps.pubsub.outputs.subscription_id || vars.PUBSUB_SUBSCRIPTION_ID || format('{0}-{1}-sub', vars.TOPIC_ID, github.ref_name) }}"
+          gcloud pubsub subscriptions describe "$SUB" --project "${{ vars.GCP_PROJECT_ID }}"
+          gcloud pubsub subscriptions pull "$SUB" --project "${{ vars.GCP_PROJECT_ID }}" --limit=5 --auto-ack || true
+
+
+  # --- 2) Pull messages and write to Parquet/GCS ------------------------
+  PubSub-Consume-To-Parquet:
+    needs: [PubSub-Pipeline]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install google-cloud-pubsub google-cloud-storage pandas pyarrow
+
+      - name: Resolve branch/env + subscription
+        id: resolve
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          TOPIC_ID: ${{ vars.TOPIC_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          # Prefer the ID created in previous job; else fall back to var or branch default...
+          CREATED_SUB_ID: ${{ needs.PubSub-Pipeline.outputs.PUBSUB_SUBSCRIPTION_ID }}
+          VAR_SUB_ID: ${{ vars.PUBSUB_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME:-manual}"
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
+
+          # Decide subscription id:
+          # 1) created in previous job, 2) provided var, 3) default <topic>-<branch>-sub
+          SUB_ID="${CREATED_SUB_ID:-${VAR_SUB_ID:-${TOPIC_ID}-${BRANCH}-sub}}"
+          echo "SUBSCRIPTION_ID=${SUB_ID}" >> $GITHUB_ENV
+          echo "SUBSCRIPTION_FULL=projects/${PROJECT_ID}/subscriptions/${SUB_ID}" >> $GITHUB_ENV
+
+      - name: Activate SA for BigQuery
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          echo "${GCP_SA_KEY}" > key.json
+          gcloud auth activate-service-account --key-file=key.json
+          gcloud config set project $GCP_PROJECT_ID
+
+      - name: Create BigQuery dataset if not exists
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          BQ_DATASET: flight_data_dev
+        run: |
+          set -euo pipefail
+          echo "Ensuring dataset exists: ${PROJECT_ID}:${BQ_DATASET}"
+          bq mk --dataset --location=US "${PROJECT_ID}:${BQ_DATASET}" 2>/dev/null || \
+            echo "Dataset already exists — continuing"
+
+      - name: Run consumer (Pub/Sub → Parquet → GCS source-<branch>)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+          SUBSCRIPTION_ID: ${{ env.SUBSCRIPTION_ID }}
+          SUBSCRIPTION_FULL: ${{ env.SUBSCRIPTION_FULL }}
+          BRANCH: ${{ env.BRANCH }}
+          MAX_MESSAGES: "5000"
+          MAX_WAIT_SECS: "60"
+          PARQUET_ROW_GROUP: "100000"
+        run: |
+          set -euo pipefail
+          gcloud config set project "${PROJECT_ID}"
+          python3 consumer.py
+
+  Composer-Ensure-Env:
+    needs: [Bucket-Create-And-Seed]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Ensure Composer env (create if absent), auto-create SA, grant IAM, and output bucket
+        id: ensure
+        env:
+          REGION: ${{ vars.COMPOSER_REGION }}
+          ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+          ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}
+          IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }}    # e.g., composer-2-airflow-2 or a pinned version.
+          ENV_SA: ${{ vars.COMPOSER_ENV_SA }}                  # optional; if empty, we'll create/use composer-env-sa@<project>
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket...
+        run: |
+          set -euo pipefail
+
+          # --- Resolve project + caller + region ---
+          : "${REGION:?Set COMPOSER_REGION}"
+          PROJECT_ID="$(gcloud config get-value project)"
+          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+          CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+
+          # --- Pick env by branch (dev/main), else fallback to single-env ---
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
+            ENV_NAME="$ENV_DEV"
+          elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
+            ENV_NAME="$ENV_PROD"
+          elif [[ -n "${ENV_SINGLE:-}" ]]; then
+            ENV_NAME="$ENV_SINGLE"
+          else
+            echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME)."
+            exit 1
+          fi
+
+          echo "Project: $PROJECT_ID ($PROJECT_NUMBER)"
+          echo "Caller : $CALLER"
+          echo "Region : $REGION"
+          echo "Env    : $ENV_NAME"
+
+          # --- Decide env SA email (use provided or default name) ---
+          if [[ -n "${ENV_SA:-}" ]]; then
+            ENV_SA_EMAIL="$ENV_SA"
+          else
+            ENV_SA_EMAIL="composer-env-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+          fi
+          SA_NAME="${ENV_SA_EMAIL%%@*}"   # left of @
+          echo "Environment SA: $ENV_SA_EMAIL"
+
+          # --- Create env SA if it doesn't exist ---
+          if ! gcloud iam service-accounts describe "$ENV_SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            echo "Creating service account: $SA_NAME"
+            gcloud iam service-accounts create "$SA_NAME" \
+              --display-name="Composer Environment SA" \
+              --project="$PROJECT_ID"
+          else
+            echo "Service account already exists."
+          fi
+
+          # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/composer.worker" >/dev/null || true
+
+          # --- Ensure IAM: CI caller can create envs & act as env SA ---
+          # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY).
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/composer.admin" >/dev/null || true
+
+          # =====================================================================
+          # Enable Dataproc API (and commonly needed services) + grant Dataproc roles
+          # =====================================================================
+          echo "Enabling core services (idempotent)..."
+          gcloud services enable \
+            dataproc.googleapis.com \
+            compute.googleapis.com \
+            bigquery.googleapis.com \
+            logging.googleapis.com \
+            storage.googleapis.com \
+            artifactregistry.googleapis.com \
+            --project "$PROJECT_ID"
+
+          # Execution SA for Dataproc Serverless batches:
+          # - prefer repo/org variable DATAPROC_SA when set
+          # - else use the project's default compute SA
+          EXEC_SA="${{ vars.DATAPROC_SA }}"
+          EXEC_SA="${EXEC_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+          echo "Dataproc execution SA: ${EXEC_SA}"
+
+          gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/iam.serviceAccountUser" \
+            --project "$PROJECT_ID" >/dev/null || true
+
+          gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/iam.serviceAccountTokenCreator" \
+            --project "$PROJECT_ID" >/dev/null || true
+
+          echo "Composer SA '${ENV_SA_EMAIL}' can now act as '${EXEC_SA}'."
+
+          # The caller that invokes createBatch is the Composer environment SA.
+          # Grant it permission to create batches.
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/dataproc.editor" >/dev/null || true
+
+          # Optional: grant Dataproc roles to the execution SA as well (not strictly required to create batches)
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${EXEC_SA}" \
+            --role="roles/dataproc.serverlessViewer" >/dev/null || true
+
+          gcloud iam service-accounts add-iam-policy-binding "$ENV_SA_EMAIL" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/iam.serviceAccountUser" >/dev/null || true
+
+          # --- Ensure IAM: Composer service agent extension (one-time per project, safe to repeat) ---
+          COMPOSER_AGENT="service-${PROJECT_NUMBER}@cloudcomposer-accounts.iam.gserviceaccount.com"
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${COMPOSER_AGENT}" \
+            --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
+          
+          # --- Create Composer env if absent (pass SA and optional bucket) ---
+          if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
+            echo "Creating Composer env: $ENV_NAME in $REGION"
+            CREATE_ARGS=( --location "$REGION" --service-account "$ENV_SA_EMAIL" )
+            if [[ -n "${IMAGE_VERSION:-}" ]]; then
+              CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
+            fi
+            if [[ -n "${COMPOSER_BUCKET:-}" ]]; then
+              CREATE_ARGS+=( --cloud-storage-bucket "$COMPOSER_BUCKET" )
+            fi
+            gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
+          else
+            echo "Composer env $ENV_NAME already exists."
+          fi
+
+          # --- Discover outputs (works whether bucket was auto-created or provided) ---
+          BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
+          DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
+          AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+
+          echo "Composer bucket: $BUCKET"
+          echo "DAGs prefix:     $DAGS_PREFIX"
+          echo "Airflow UI:      $AIRFLOW_URI"
+
+
+  # -------------------------------------------------------------------
+  # 2) Deploy to Airflow in Composer: picks variables.json based on branch,
+  #    imports variables, and uploads your DAG to the Composer bucket/prefix.
+  # -------------------------------------------------------------------
+  Bucket-Airflow-Deploy:
+    needs: [Composer-Ensure-Env]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud + gsutil
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Resolve Composer env, bucket, and dags prefix
+        env:
+          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
+          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          COMPOSER_ENV_PROD_NAME: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+          COMPOSER_REGION: ${{ vars.COMPOSER_REGION }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME:-}"
+          : "${COMPOSER_REGION:?Set COMPOSER_REGION}"
+
+          # Pick env by branch or fallback
+          if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
+          elif [[ "$BRANCH" == "main" && -n "${COMPOSER_ENV_PROD_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_PROD_NAME"
+          elif [[ -n "${COMPOSER_ENV_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_NAME"
+          else
+            echo "ERROR: Not on dev/main and COMPOSER_ENV_NAME is unset."; exit 1
+          fi
+          echo "Using Composer env: ${COMPOSER_ENV}"
+          echo "COMPOSER_ENV=${COMPOSER_ENV}" >> $GITHUB_ENV
+
+          # Ensure env exists and is RUNNING (quick check)
+          STATE="$(gcloud composer environments describe "${COMPOSER_ENV}" --location "${COMPOSER_REGION}" --format='value(state)')"
+          [[ "${STATE}" == "RUNNING" ]] || { echo "ERROR: Env state is ${STATE}"; exit 1; }
+
+          # Get DAGS prefix (works in Composer 2 & 3)
+          DAGS_PREFIX="$(gcloud composer environments describe "${COMPOSER_ENV}" \
+            --location "${COMPOSER_REGION}" --format='value(config.dagGcsPrefix)')"
+          [[ -n "${DAGS_PREFIX}" ]] || { echo "ERROR: dagGcsPrefix is empty"; exit 1; }
+
+          # Get bucket for Composer 3 (storageConfig.bucket). If empty, derive from dagGcsPrefix.
+          BUCKET_NAME="$(gcloud composer environments describe "${COMPOSER_ENV}" \
+            --location "${COMPOSER_REGION}" --format='value(storageConfig.bucket)')"
+          if [[ -z "${BUCKET_NAME}" ]]; then
+            TMP="${DAGS_PREFIX#gs://}"   # strip scheme
+            BUCKET_NAME="${TMP%%/*}"     # first path segment
+          fi
+          [[ -n "${BUCKET_NAME}" ]] || { echo "ERROR: Could not resolve bucket name"; exit 1; }
+          BUCKET_URI="gs://${BUCKET_NAME}"
+
+          echo "Composer bucket URI: ${BUCKET_URI}"
+          echo "DAGs prefix:         ${DAGS_PREFIX}"
+
+          # Grant write on the bucket to the calling SA (use GCS URL, not bare name)
+          CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          echo "Granting roles/storage.objectAdmin on ${BUCKET_URI} to ${CALLER}"
+          gcloud storage buckets add-iam-policy-binding "${BUCKET_URI}" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/storage.objectAdmin" >/dev/null
+
+          # Optional: quick check
+          gcloud storage buckets get-iam-policy "${BUCKET_URI}" \
+            --format="flattened(bindings[].role,bindings[].members[])" | sed -n '1,10p' || true
+
+          # Export for next steps
+          echo "BUCKET_URI=${BUCKET_URI}"   >> $GITHUB_ENV
+          echo "DAGS_PREFIX=${DAGS_PREFIX}" >> $GITHUB_ENV
+
+
+      - name: Upload DAG and Import Variables into Airflow
+        run: |
+          set -euo pipefail
+
+          # Pull config resolved earlier
+          COMPOSER_REGION="${{ vars.COMPOSER_REGION }}"
+          COMPOSER_ENV="${{ env.COMPOSER_ENV }}"
+          DAGS_PREFIX="${{ env.DAGS_PREFIX }}"
+          BUCKET_URI="${{ env.BUCKET_URI }}"
+
+          # Local files
+          LOCAL_DAG_PATH="airflow_job/airflow_job.py"
+          LOCAL_VARS_DEV="variables/dev/variables.json"
+          LOCAL_VARS_PROD="variables/prod/variables.json"
+
+          # Choose dev/prod file by branch
+          BRANCH="${GITHUB_REF_NAME:-}"
+          if [[ "$BRANCH" == "dev" ]]; then
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
+          elif [[ "$BRANCH" == "main" ]]; then
+            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"; VARS_SUBDIR="prod"
+          else
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
+          fi
+
+          # Sanity
+          : "${COMPOSER_REGION:?COMPOSER_REGION not set}"
+          : "${COMPOSER_ENV:?COMPOSER_ENV not set}"
+          [[ -f "$LOCAL_DAG_PATH" ]]  || { echo "Missing $LOCAL_DAG_PATH"; exit 1; }
+          [[ -f "$LOCAL_VARS_PATH" ]] || { echo "Missing $LOCAL_VARS_PATH"; exit 1; }
+          [[ -n "${DAGS_PREFIX:-}" && -n "${BUCKET_URI:-}" ]] || { echo "Missing bucket/prefix"; exit 1; }
+
+          echo "Copying DAG to ${DAGS_PREFIX}/"
+          gsutil cp "$LOCAL_DAG_PATH" "${DAGS_PREFIX}/"
+
+          # Keep a copy of variables.json in GCS (optional, handy for audit)
+          VARS_GCS="${BUCKET_URI}/data/variables/${VARS_SUBDIR}/variables.json"
+          echo "Copying variables JSON to ${VARS_GCS}"
+          gsutil cp "$LOCAL_VARS_PATH" "$VARS_GCS"
+
+          # Export for Python
+          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH
+
+          python3 - <<'PY'
+          import json, os, subprocess, shlex, sys, hashlib
+
+          env_name  = os.environ["COMPOSER_ENV"]
+          region    = os.environ["COMPOSER_REGION"]
+          vars_path = os.environ["LOCAL_VARS_PATH"]
+
+          # Load variables file + compute a versioned hash so we force one overwrite now
+          raw = open(vars_path, "rb").read()
+          md5 = hashlib.md5(raw).hexdigest()
+          vars_hash_key = "AIRFLOW_VAR__VARS_HASH"
+          new_hash_value = f"v2:{md5}"   # bump to v2 to override any old quoted values
+
+          # Read current env vars to decide whether to skip
+          desc = subprocess.run(
+              ["gcloud","composer","environments","describe",env_name,"--location",region,"--format=json"],
+              capture_output=True, text=True
+          )
+          if desc.returncode != 0:
+              print("Failed to describe Composer env.", file=sys.stderr)
+              sys.exit(desc.returncode)
+
+          try:
+              j = json.loads(desc.stdout)
+              env_vars = j.get("config", {}).get("softwareConfig", {}).get("envVariables", {})
+          except Exception:
+              env_vars = {}
+
+          if env_vars.get(vars_hash_key) == new_hash_value:
+              print("Variables unchanged (hash match). Skipping Composer update.")
+              sys.exit(0)
+
+          data = json.loads(raw.decode("utf-8"))
+
+          def key_to_env(k: str) -> str:
+              # Airflow reads AIRFLOW_VAR_<KEY> for Variable.get("<key>")
+              return "AIRFLOW_VAR_" + "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
+
+          pairs = []
+          for k, v in data.items():
+              env_key = key_to_env(k)
+              # IMPORTANT: leave strings as plain values (no quotes); JSON-encode non-strings
+              if isinstance(v, str):
+                  val = v
+              else:
+                  val = json.dumps(v, ensure_ascii=False)
+              # Protect our custom delimiter if it appears in values
+              val = val.replace("|", r"\|")
+              pairs.append(f"{env_key}={val}")
+
+          # Add the versioned hash so subsequent runs can skip if unchanged
+          pairs.append(f"{vars_hash_key}={new_hash_value}")
+
+          # Single Composer update (one restart) using a custom delimiter (^|^)
+          arg_value = "^|^" + "|".join(pairs)
+          cmd = [
+              "gcloud","composer","environments","update",env_name,
+              "--location",region,
+              f"--update-env-variables={arg_value}"
+          ]
+          print(">>", " ".join(shlex.quote(x) for x in cmd))
+          sys.exit(subprocess.call(cmd))
+          PY
+
+          echo "Done. (If an update was needed, Composer components restarted once.)"
+
+
+  # -------------------------------------------------------------------
+  # 3) (Optional) Upload Spark job artifact to a bucket per branch.
+  # -------------------------------------------------------------------
+  upload-to-dev:
+    if: github.ref == 'refs/heads/dev'
+    needs: [Bucket-Create-And-Seed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Upload Spark Job to GCS (dev)
+        env:
+          SPARK_BUCKET_NAME: ${{ vars.SPARK_BUCKET_NAME || vars.BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          # from your machine/CI
+          gsutil cp spark_job/spark_transformation_job.py gs://${SPARK_BUCKET_NAME}/spark-job/spark_transformation_job.py
+
+
+  upload-to-prod:
+    if: github.ref == 'refs/heads/main'
+    needs: [Bucket-Create-And-Seed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Upload Spark Job to GCS (prod)
+        env:
+          SPARK_BUCKET_NAME: ${{ vars.SPARK_BUCKET_NAME || vars.BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          gsutil cp spark_job/spark_transformation_job.py "gs://${SPARK_BUCKET_NAME}/spark-job/"

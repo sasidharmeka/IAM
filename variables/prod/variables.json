@@ -1,0 +1,30 @@
+{
+    "env": "prod",
+    "gcs_bucket": "iam-datalake-prod",
+    "bq_project": "authentic-codex-475613-p1",
+    "bq_dataset": "IAM_data_prod",
+    "tables": {
+      "impossible_table": "impossible_login_anomalies",
+      "mfa_table": "mfa_bypass_events",
+      "mfa_all_table": "mfa_bypass_events_all_apps",
+      "impossible_travel_table": "impossible_travel_events",
+      "privilege_escalation_table": "privilege_escalation_without_request",
+      "ad_volume_spike_table": "ad_volume_spikes",
+      "rejected_executed_table": "rejected_but_executed",
+      "high_risk_seq_table": "high_risk_sequence",
+      "excessive_data_table": "excessive_data_transferred",
+      "role_drift_table": "role_drift",
+      "stale_access_table": "stale_access",
+      "multi_app_session_table": "multi_app_single_session",
+      "mfa_drift_table": "mfa_drift",
+      "suspicious_approver_table": "suspicious_approver_behavior",
+      "ad_churn_table": "ad_group_churn_rate",
+      "orphan_event_table": "orphan_event_detection",
+      "orphan_user_table": "orphan_user_detection",
+      "cleanest_users_table": "cleanest_users",
+      "shadow_table": "shadow_access_events",
+      "risk_table": "risk_scores",
+      "timeline_table": "identity_timelines",
+      "time_warp_table": "suspicious_time_warp"
+    }
+  }
