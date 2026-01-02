@@ -563,6 +563,7 @@ jobs:
           raw = open(vars_path, "rb").read()
           md5 = hashlib.md5(raw).hexdigest()
           vars_hash_key = "AIRFLOW_VAR__VARS_HASH"
+          import time
           new_hash_value = f"v3:{md5}:{int(time.time())}"  # bump to v2 to override any old quoted values
 
           # Read current env vars to decide whether to skip
