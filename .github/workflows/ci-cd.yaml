@@ -1,4 +1,4 @@
-name: Flight Booking CICD
+name: IAM Data Platform CI/CD
 
 on:
   push:
@@ -55,7 +55,8 @@ jobs:
           fi
 
           # Create 5 top-level prefixes if they don't already exist
-          FOLDERS=("data" "output" "source-dev" "source-prod" "spark-job" "metadata")
+          FOLDERS=("data" "output" "source" "spark-job" "metadata")
+
           for dir in "${FOLDERS[@]}"; do
             if ! gsutil ls -d "gs://${BUCKET_NAME}/${dir}/" >/dev/null 2>&1; then
               echo "Creating prefix gs://${BUCKET_NAME}/${dir}/ (via placeholder)"
@@ -223,7 +224,8 @@ jobs:
       - name: Create BigQuery dataset if not exists
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          BQ_DATASET: flight_data_dev
+          BQ_DATASET: iam_raw_${{ github.ref_name }}
+
         run: |
           set -euo pipefail
           echo "Ensuring dataset exists: ${PROJECT_ID}:${BQ_DATASET}"
