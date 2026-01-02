@@ -131,7 +131,7 @@ for source in SOURCES:
         file_sensor = GCSObjectsWithPrefixExistenceSensor(
             task_id=f"check_file_arrival_{source}",
             bucket=gcs_bucket,
-            prefix=f"source/{source}/{{{{ ds_nodash }}}}-",
+            prefix=f"source/{source}/{{{{ ds_nodash }}}}",
             google_cloud_conn_id="google_cloud_default",
             timeout=300,
             poke_interval=30,
