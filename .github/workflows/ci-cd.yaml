@@ -74,10 +74,18 @@ jobs:
     needs: [Bucket-Create-And-Seed]
     runs-on: ubuntu-latest
 
-    # Expose the created subscription id to downstream jobs
+    # Expose the created subscription ids to downstream jobs (one per source)
     outputs:
-      PUBSUB_SUBSCRIPTION_ID: ${{ steps.pubsub.outputs.subscription_id }}
-      PUBSUB_SUBSCRIPTION_FULL: ${{ steps.pubsub.outputs.subscription_full }}
+      SUB_OKTA: ${{ steps.pubsub.outputs.sub_okta }}
+      SUB_OKTA_FULL: ${{ steps.pubsub.outputs.sub_okta_full }}
+      SUB_AD: ${{ steps.pubsub.outputs.sub_ad }}
+      SUB_AD_FULL: ${{ steps.pubsub.outputs.sub_ad_full }}
+      SUB_APP: ${{ steps.pubsub.outputs.sub_app_usage }}
+      SUB_APP_FULL: ${{ steps.pubsub.outputs.sub_app_usage_full }}
+      SUB_SAV: ${{ steps.pubsub.outputs.sub_saviynt }}
+      SUB_SAV_FULL: ${{ steps.pubsub.outputs.sub_saviynt_full }}
+      SUB_HR: ${{ steps.pubsub.outputs.sub_hrlifecycle }}
+      SUB_HR_FULL: ${{ steps.pubsub.outputs.sub_hrlifecycle_full }}
 
     steps:
       - uses: actions/checkout@v4
@@ -90,65 +98,87 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      - name: Resolve/create Pub/Sub topic & subscription (idempotent)
+      - name: Resolve/create Pub/Sub topics & subscriptions (idempotent)
         id: pubsub
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          # Per-source topic vars (set these repo vars or leave empty for defaults)
+          TOPIC_OKTA: ${{ vars.TOPIC_OKTA }}
+          TOPIC_AD: ${{ vars.TOPIC_AD }}
+          TOPIC_APP: ${{ vars.TOPIC_APP }}
+          TOPIC_SAV: ${{ vars.TOPIC_SAV }}
+          TOPIC_HR: ${{ vars.TOPIC_HR }}
+          # Fallback base topic id (optional)
           TOPIC_ID: ${{ vars.TOPIC_ID }}
-          # Optional; if empty we'll auto-name: <topic>-<branch>-sub
-          SUBSCRIPTION_ID_INPUT: ${{ vars.PUBSUB_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
-
           : "${PROJECT_ID:?PROJECT_ID not set}"
-          : "${TOPIC_ID:?TOPIC_ID not set}"
-
           gcloud config set project "${PROJECT_ID}"
 
           BRANCH="${GITHUB_REF_NAME:-manual}"
-          SUB="${SUBSCRIPTION_ID_INPUT:-${TOPIC_ID}-${BRANCH}-sub}"
 
-          echo "Project: ${PROJECT_ID}"
-          echo "Topic:   ${TOPIC_ID}"
-          echo "Sub:     ${SUB}"
+          sources=(okta ad app_usage saviynt hrlifecycle)
+          topics=("${TOPIC_OKTA}" "${TOPIC_AD}" "${TOPIC_APP}" "${TOPIC_SAV}" "${TOPIC_HR}")
 
-          # Ensure topic exists
-          gcloud pubsub topics describe "${TOPIC_ID}" >/dev/null 2>&1 \
-            || gcloud pubsub topics create "${TOPIC_ID}"
-
-          # Auto-heal orphaned subs (_deleted-topic_) and ensure sub points to the right topic
-          if gcloud pubsub subscriptions describe "${SUB}" >/dev/null 2>&1; then
-            ACTUAL_TOPIC="$(gcloud pubsub subscriptions describe "${SUB}" --format='value(topic)')"
-            if [[ "${ACTUAL_TOPIC}" == "_deleted-topic_" || "${ACTUAL_TOPIC}" != "projects/${PROJECT_ID}/topics/${TOPIC_ID}" ]]; then
-              echo "Subscription ${SUB} is orphaned (topic=${ACTUAL_TOPIC}). Recreating..."
-              gcloud pubsub subscriptions delete "${SUB}" || true
-              gcloud pubsub subscriptions create "${SUB}" --topic="${TOPIC_ID}" --ack-deadline=60
+          for i in "${!sources[@]}"; do
+            src=${sources[$i]}
+            topic=${topics[$i]}
+            if [[ -z "${topic}" ]]; then
+              # default naming: <TOPIC_ID>-<source> or topic-<source>
+              if [[ -n "${TOPIC_ID:-}" ]]; then
+                topic="${TOPIC_ID}-${src}"
+              else
+                topic="topic-${src}"
+              fi
             fi
-          else
-            gcloud pubsub subscriptions create "${SUB}" --topic="${TOPIC_ID}" --ack-deadline=60
-          fi
 
-          FULL_SUB="projects/${PROJECT_ID}/subscriptions/${SUB}"
-          echo "PUBSUB_SUBSCRIPTION_ID=${SUB}"        >> "$GITHUB_ENV"
-          echo "PUBSUB_SUBSCRIPTION_FULL=${FULL_SUB}" >> "$GITHUB_ENV"
-          echo "subscription_id=${SUB}"               >> "$GITHUB_OUTPUT"
-          echo "subscription_full=${FULL_SUB}"        >> "$GITHUB_OUTPUT"
+            echo "Ensuring topic '${topic}' for source '${src}'"
+            gcloud pubsub topics describe "${topic}" >/dev/null 2>&1 || gcloud pubsub topics create "${topic}"
+
+            sub="${topic}-${BRANCH}-sub"
+            if gcloud pubsub subscriptions describe "${sub}" >/dev/null 2>&1; then
+              echo "Subscription ${sub} exists"
+              ACTUAL_TOPIC="$(gcloud pubsub subscriptions describe "${sub}" --format='value(topic)')"
+              if [[ "${ACTUAL_TOPIC}" == "_deleted-topic_" || -n "${ACTUAL_TOPIC}" && "${ACTUAL_TOPIC}" != "projects/${PROJECT_ID}/topics/${topic}" ]]; then
+                echo "Subscription ${sub} is orphaned or points to wrong topic. Recreating..."
+                gcloud pubsub subscriptions delete "${sub}" || true
+                gcloud pubsub subscriptions create "${sub}" --topic="${topic}" --ack-deadline=60
+              fi
+            else
+              gcloud pubsub subscriptions create "${sub}" --topic="${topic}" --ack-deadline=60
+            fi
+
+            full_sub="projects/${PROJECT_ID}/subscriptions/${sub}"
+            # export per-source env for downstream steps
+            key_sub="sub_${src}"
+            key_sub_full="sub_${src}_full"
+            echo "${key_sub}=${sub}" >> "$GITHUB_OUTPUT"
+            echo "${key_sub_full}=${full_sub}" >> "$GITHUB_OUTPUT"
+            echo "SUB_${src^^}=${sub}" >> "$GITHUB_ENV"
+            echo "SUB_${src^^}_FULL=${full_sub}" >> "$GITHUB_ENV"
+            echo "TOPIC_${src^^}=${topic}" >> "$GITHUB_ENV"
+          done
 
 
       - name: Publish messages using producer.py
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          TOPIC_OKTA: ${{ vars.TOPIC_OKTA }}
+          TOPIC_AD: ${{ vars.TOPIC_AD }}
+          TOPIC_APP: ${{ vars.TOPIC_APP }}
+          TOPIC_SAV: ${{ vars.TOPIC_SAV }}
+          TOPIC_HR: ${{ vars.TOPIC_HR }}
           TOPIC_ID: ${{ vars.TOPIC_ID }}
         run: |
           set -euo pipefail
           gcloud config set project "${PROJECT_ID}"
           python3 -m pip install --upgrade pip google-cloud-pubsub
-          # Make sure producer can read envs: PROJECT_ID, TOPIC_ID
+          # Producer reads TOPIC_* envs and publishes CSV rows accordingly
           python3 producer.py
-          echo "Verifying backlog on sub..."
-          SUB="${{ steps.pubsub.outputs.subscription_id || vars.PUBSUB_SUBSCRIPTION_ID || format('{0}-{1}-sub', vars.TOPIC_ID, github.ref_name) }}"
-          gcloud pubsub subscriptions describe "$SUB" --project "${{ vars.GCP_PROJECT_ID }}"
-          gcloud pubsub subscriptions pull "$SUB" --project "${{ vars.GCP_PROJECT_ID }}" --limit=5 --auto-ack || true
+          echo "Verifying backlog on one of the subs (okta)..."
+          SUB_CHECK="${{ steps.pubsub.outputs.sub_okta || env.SUB_OKTA || format('{0}-okta-sub', vars.TOPIC_ID) }}"
+          gcloud pubsub subscriptions describe "$SUB_CHECK" --project "${{ vars.GCP_PROJECT_ID }}" || true
+          gcloud pubsub subscriptions pull "$SUB_CHECK" --project "${{ vars.GCP_PROJECT_ID }}" --limit=5 --auto-ack || true
 
 
   # --- 2) Pull messages and write to Parquet/GCS ------------------------
@@ -171,25 +201,15 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install google-cloud-pubsub google-cloud-storage pandas pyarrow
 
-      - name: Resolve branch/env + subscription
+      - name: Resolve branch/env
         id: resolve
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           TOPIC_ID: ${{ vars.TOPIC_ID }}
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          # Prefer the ID created in previous job; else fall back to var or branch default...
-          CREATED_SUB_ID: ${{ needs.PubSub-Pipeline.outputs.PUBSUB_SUBSCRIPTION_ID }}
-          VAR_SUB_ID: ${{ vars.PUBSUB_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_REF_NAME:-manual}"
           echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
-
-          # Decide subscription id:
-          # 1) created in previous job, 2) provided var, 3) default <topic>-<branch>-sub
-          SUB_ID="${CREATED_SUB_ID:-${VAR_SUB_ID:-${TOPIC_ID}-${BRANCH}-sub}}"
-          echo "SUBSCRIPTION_ID=${SUB_ID}" >> $GITHUB_ENV
-          echo "SUBSCRIPTION_FULL=projects/${PROJECT_ID}/subscriptions/${SUB_ID}" >> $GITHUB_ENV
 
       - name: Activate SA for BigQuery
         env:
@@ -216,6 +236,12 @@ jobs:
           BUCKET_NAME: ${{ vars.BUCKET_NAME }}
           SUBSCRIPTION_ID: ${{ env.SUBSCRIPTION_ID }}
           SUBSCRIPTION_FULL: ${{ env.SUBSCRIPTION_FULL }}
+          # Per-source subscription ids created in previous job
+          SUB_OKTA: ${{ needs.PubSub-Pipeline.outputs.SUB_OKTA }}
+          SUB_AD: ${{ needs.PubSub-Pipeline.outputs.SUB_AD }}
+          SUB_APP: ${{ needs.PubSub-Pipeline.outputs.SUB_APP }}
+          SUB_SAV: ${{ needs.PubSub-Pipeline.outputs.SUB_SAV }}
+          SUB_HR: ${{ needs.PubSub-Pipeline.outputs.SUB_HR }}
           BRANCH: ${{ env.BRANCH }}
           MAX_MESSAGES: "5000"
           MAX_WAIT_SECS: "60"
