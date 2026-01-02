@@ -21,7 +21,7 @@ def check_and_mark_file(source: str, **context):
     gcs_bucket = Variable.get("gcs_bucket", default_var="airflow-IAM-proj")
 
     execution_date = context["ds_nodash"]
-    prefix = f"source/{source}/{execution_date}-"
+    prefix = f"source/{source}/{execution_date}"
 
     metadata_blob_name = f"metadata/{source}_processed.json"
 
