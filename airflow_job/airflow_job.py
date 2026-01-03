@@ -4,7 +4,7 @@ import json
 
 from airflow import DAG
 from airflow.models import Variable
-from airflow.operators.python import ShortCircuitOperator
+from airflow.operators.python import ShortCircuitOperator, PythonOperator
 from airflow.providers.google.cloud.operators.dataproc import DataprocCreateBatchOperator
 from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
 
@@ -12,7 +12,11 @@ from google.cloud import storage
 
 
 def check_and_mark_file(source: str, **context):
-    """Select exactly one unprocessed parquet for `source`, mark it processed, and push to XCom.
+    """Select exactly one unprocessed parquet for `source` and push to XCom.
+
+    NOTE: this no longer marks the file as processed. Marking is deferred to
+    a downstream task that runs after the Spark job succeeds so we don't
+    skip files when Spark fails.
 
     Looks under: gs://{gcs_bucket}/source/{source}/{ds_nodash}-*.parquet
     Tracks processed files in: metadata/{source}_processed.json
@@ -54,7 +58,7 @@ def check_and_mark_file(source: str, **context):
             elif isinstance(data, list):
                 processed_files = data
             else:
-                print("Warning: metadata format unexpected, starting fresh list.")
+                print("Warning: metadata format unexpected, treating as empty list.")
         except Exception as e:
             print(f"Warning: could not parse existing metadata: {e}")
 
@@ -62,13 +66,49 @@ def check_and_mark_file(source: str, **context):
         print(f"{selected_file} already processed for {source}. Skipping Spark job.")
         return False
 
+    # Do NOT mark processed here. Push selected file to XCom and allow downstream
+    # tasks (the Spark job + a dedicated marker) to decide when to mark it.
+    context["ti"].xcom_push(key="selected_file", value=selected_file)
+    print(f"Selected {selected_file} for processing (will mark after Spark succeeds)")
+    return True
+
+
+def mark_file_processed(source: str, **context):
+    """Append the selected file to metadata/{source}_processed.json after successful run."""
+    env = Variable.get("env", default_var="dev")
+    gcs_bucket = Variable.get("gcs_bucket", default_var="airflow-IAM-proj")
+
+    ti = context["ti"]
+    selected_file = ti.xcom_pull(task_ids=f"check_if_already_processed_{source}", key="selected_file")
+    if not selected_file:
+        print("No selected_file in XCom; nothing to mark.")
+        return
+
+    metadata_blob_name = f"metadata/{source}_processed.json"
+    client = storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    meta_blob = bucket.blob(metadata_blob_name)
+
+    processed_files = []
+    if meta_blob.exists():
+        try:
+            raw = meta_blob.download_as_text()
+            data = json.loads(raw)
+            if isinstance(data, dict) and "processed_files" in data:
+                processed_files = data["processed_files"]
+            elif isinstance(data, list):
+                processed_files = data
+        except Exception as e:
+            print(f"Warning: could not parse existing metadata: {e}")
+
+    if selected_file in processed_files:
+        print(f"{selected_file} already present in metadata for {source}; nothing to do.")
+        return
+
     processed_files.append(selected_file)
     out = json.dumps({"processed_files": processed_files}, indent=2)
     meta_blob.upload_from_string(out, content_type="application/json")
-
     print(f"Marked {selected_file} as processed in {metadata_blob_name}")
-    context["ti"].xcom_push(key="selected_file", value=selected_file)
-    return True
 
 
 default_args = {
@@ -207,6 +247,12 @@ for source in SOURCES:
             gcp_conn_id="google_cloud_default",
         )
 
-        file_sensor >> check_new_file >> pyspark_task
+        mark_task = PythonOperator(
+            task_id=f"mark_processed_{source}",
+            python_callable=mark_file_processed,
+            op_kwargs={"source": source},
+        )
+
+        file_sensor >> check_new_file >> pyspark_task >> mark_task
 
     globals()[dag_id] = dag
