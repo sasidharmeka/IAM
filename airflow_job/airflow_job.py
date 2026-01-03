@@ -462,6 +462,7 @@ for source in SOURCES:
             if temp_gcs_bucket:
                 spark_args.append(f"--temp_gcs_bucket={temp_gcs_bucket}")
 
+          
             batch_details = {
                 "pyspark_batch": {
                     "main_python_file_uri": main_py_uri,
@@ -469,7 +470,16 @@ for source in SOURCES:
                     "jar_file_uris": [],
                     "args": spark_args,
                 },
-                "runtime_config": {"version": "2.2"},
+                "runtime_config": {
+                    "version": "2.2",
+                    "properties": {  # <-- THIS IS THE NEW PART
+                        "spark.executor.instances": "2",
+                        "spark.driver.cores": "2",
+                        "spark.driver.memory": "4g",
+                        "spark.executor.cores": "2",
+                        "spark.executor.memory": "4g",
+                    }
+                },
                 "environment_config": {
                     "execution_config": {
                         "service_account": Variable.get("dataproc_service_account", default_var=""),
@@ -478,7 +488,7 @@ for source in SOURCES:
                     }
                 },
             }
-
+            
             pyspark_task = DataprocCreateBatchOperator(
                 task_id=f"run_spark_job_{source}",
                 batch=batch_details,
