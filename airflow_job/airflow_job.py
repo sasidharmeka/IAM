@@ -496,7 +496,7 @@ for source in SOURCES:
                 trigger_rule="all_success",
             )
 
-            # Define task dependencies
+            # Define task dependencies..s
             file_sensor >> check_new_file >> log_spark_start >> pyspark_task >> mark_task
 
         globals()[dag_id] = dag
