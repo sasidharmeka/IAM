@@ -482,7 +482,7 @@ for source in SOURCES:
             pyspark_task = DataprocCreateBatchOperator(
                 task_id=f"run_spark_job_{source}",
                 batch=batch_details,
-                batch_id=f"IAM-batch-{source}-{{{{ ds_nodash }}}}-{str(uuid.uuid4())[:8]}",
+                batch_id=f"iam-batch-{source}-{{{{ ds_nodash }}}}-{str(uuid.uuid4())[:8]}",
                 project_id=bq_project,
                 region=Variable.get("dataproc_region", default_var="us-central1"),
                 gcp_conn_id="google_cloud_default",
