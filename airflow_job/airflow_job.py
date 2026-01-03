@@ -473,10 +473,10 @@ for source in SOURCES:
                 "runtime_config": {
                     "version": "2.2",
                     "properties": {  # <-- THIS IS THE NEW PART
-                        "spark.executor.instances": "2",
-                        "spark.driver.cores": "2",
+                        "spark.executor.instances": "4",
+                        "spark.driver.cores": "4",
                         "spark.driver.memory": "4g",
-                        "spark.executor.cores": "2",
+                        "spark.executor.cores": "4",
                         "spark.executor.memory": "4g",
                     }
                 },
