@@ -61,6 +61,7 @@ def main():
         total += 1
 
     print(f"Published rows from {total} CSV sources.")
+    #
 
 
 if __name__ == "__main__":
