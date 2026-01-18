@@ -31,7 +31,7 @@ PULL_TIMEOUT = float(os.getenv("PER_PULL_TIMEOUT", "10"))
 SOURCE_SUB_MAP = {
     "okta": os.getenv("SUB_OKTA"),
     "ad": os.getenv("SUB_AD"),
-    "app_usage": os.getenv("SUB_APP"),
+    "app": os.getenv("SUB_APP"),
     "saviynt": os.getenv("SUB_SAV"),
     "hrlifecycle": os.getenv("SUB_HR"),
 }

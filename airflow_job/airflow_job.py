@@ -118,7 +118,7 @@ default_args = {
 
 SOURCES = Variable.get(
     "sources",
-    default_var=["okta", "ad", "saviynt", "app_usage", "hrlifecycle", "anomaly_key"],
+    default_var=["okta", "ad", "saviynt", "app", "hrlifecycle", "anomaly_key"],
     deserialize_json=True,
 )
 
@@ -150,6 +150,7 @@ for source in SOURCES:
             poke_interval=60,
             timeout=900,
             mode="poke",
+
         )
 
         # 2️⃣ Decide if Spark should run
