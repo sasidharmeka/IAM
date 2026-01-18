@@ -1,266 +1,272 @@
-"""
-IAM Spark transformation job (stable & minimal).
-
-Airflow → Spark contract:
-REQUIRED:
-- --env
-- --gcs_bucket
-- --bq_project
-- --bq_dataset
-- --source
-
-OPTIONAL:
-- --input_file
-- --write_method (default=direct)
-- --temp_gcs_bucket
-"""
-
 import argparse
 import logging
 import sys
-from typing import Optional
 
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.functions import col, to_timestamp, unix_timestamp, lit
+from pyspark.sql.functions import *
 from pyspark.sql.window import Window
 
-# -------------------------------------------------------------------
-# Logging
-# -------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("IAM-transform")
+# ===============================================================
+# LOGGING
+# ===============================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("iam-spark")
 
-# -------------------------------------------------------------------
-# Spark-owned table names
-# -------------------------------------------------------------------
-TABLES = {
-    "impossible": "impossible_login_anomalies",
-    "mfa": "mfa_bypass_events",
-    "shadow": "shadow_access_events",
-    "risk": "risk_scores",
-    "timeline": "identity_timelines",
-}
+# ===============================================================
+# BIGQUERY WRITE HELPER
+# ===============================================================
+def write_bq(df, project, dataset, table):
+    if df is None:
+        logger.warning(f"{table}: dataframe is None, skipping")
+        return
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
-def df_is_empty(df):
-    try:
-        return df.rdd.isEmpty()
-    except Exception:
-        return True
-
-
-def safe_read_parquet(spark, path):
-    try:
-        return spark.read.parquet(path)
-    except Exception as e:
-        logger.warning(f"No data at {path}: {e}")
-        return spark.createDataFrame([], schema=None)
-
-# -------------------------------------------------------------------
-# Detection logic (MINIMAL, SAFE)
-# -------------------------------------------------------------------
-def impossible_login(okta_df, app_df):
-    if df_is_empty(okta_df) or df_is_empty(app_df):
-        return okta_df.sparkSession.createDataFrame([], schema=None)
-
-    o = okta_df.withColumn("login_ts", to_timestamp("ts")).select("user", "login_ts")
-    a = app_df.withColumn("app_ts", to_timestamp("ts")).select("user", "app", "app_ts")
-
-    joined = (
-        o.join(a, "user")
-        .withColumn("delta_sec", unix_timestamp("app_ts") - unix_timestamp("login_ts"))
-        .filter((col("delta_sec") < 0) | (col("delta_sec") > 1800))
-    )
-
-    return joined.select(
-        "user",
-        "app",
-        "login_ts",
-        "app_ts",
-        "delta_sec"
-    )
-
-
-def mfa_bypass_detection(okta_df, app_df):
-    if df_is_empty(okta_df) or df_is_empty(app_df):
-        return okta_df.sparkSession.createDataFrame([], schema=None)
-
-    failed = okta_df.filter(col("status").like("%FAIL%")) \
-        .withColumn("fail_ts", to_timestamp("ts")) \
-        .select("user", "fail_ts")
-
-    app = app_df.withColumn("app_ts", to_timestamp("ts")) \
-        .select("user", "app", "app_ts")
-
-    joined = (
-        failed.join(app, "user")
-        .withColumn("delta_sec", unix_timestamp("app_ts") - unix_timestamp("fail_ts"))
-        .filter((col("delta_sec") > 0) & (col("delta_sec") <= 3600))
-    )
-
-    return joined.select(
-        "user",
-        "app",
-        "fail_ts",
-        "app_ts",
-        "delta_sec"
-    )
-
-
-def detect_shadow_access(okta_df, app_df, sav_df, ad_df):
-    if df_is_empty(ad_df):
-        return ad_df.sparkSession.createDataFrame([], schema=None)
-
-    return ad_df.select(
-        col("user"),
-        col("group").alias("privileged_group"),
-        to_timestamp("ts").alias("grant_time"),
-        col("initiator")
-    )
-
-
-def compute_security_reputation(okta_df, sav_df, ad_df, app_df):
-    if df_is_empty(okta_df):
-        return okta_df.sparkSession.createDataFrame([], schema=None)
-
-    risk = okta_df.groupBy("user").agg(
-        F.count("*").alias("login_count"),
-        F.sum(F.when(col("status").like("%FAIL%"), 1).otherwise(0)).alias("failed_logins")
-    )
-
-    return risk.withColumn(
-        "risk_score",
-        col("failed_logins") * 3 + col("login_count")
-    )
-
-
-def time_identity_portrait(okta_df, sav_df, ad_df, app_df):
-    frames = []
-
-    if not df_is_empty(okta_df):
-        frames.append(
-            okta_df.select(
-                to_timestamp("ts").alias("event_ts"),
-                "user",
-                lit("okta").alias("source"),
-                col("status").alias("detail")
-            )
-        )
-
-    if not df_is_empty(ad_df):
-        frames.append(
-            ad_df.select(
-                to_timestamp("ts").alias("event_ts"),
-                "user",
-                lit("ad").alias("source"),
-                col("action").alias("detail")
-            )
-        )
-
-    if not frames:
-        return okta_df.sparkSession.createDataFrame([], schema=None)
-
-    return frames[0].unionByName(*frames[1:]).orderBy("user", "event_ts")
-
-# -------------------------------------------------------------------
-# BigQuery writer
-# -------------------------------------------------------------------
-def write_bq(df, table, project, dataset, write_method):
-    if df_is_empty(df):
-        logger.info(f"Skipping empty dataframe for {table}")
+    if df.rdd.isEmpty():
+        logger.warning(f"{table}: empty dataframe, skipping")
         return
 
     (
-        df.write.format("bigquery")
+        df.write
+        .format("bigquery")
         .option("table", f"{project}:{dataset}.{table}")
-        .option("writeMethod", write_method)
         .mode("append")
         .save()
     )
 
-    logger.info(f"Wrote {project}:{dataset}.{table}")
+    logger.info(f"✅ WROTE → {project}:{dataset}.{table}")
 
-# -------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------
-def main(
-    env: str,
-    gcs_bucket: str,
-    bq_project: str,
-    bq_dataset: str,
-    source: str,
-    input_file: Optional[str],
-    write_method: str,
-    temp_gcs_bucket: Optional[str],
-):
-    spark = SparkSession.builder.appName("IAMTransform").getOrCreate()
+# ===============================================================
+# DETECTIONS
+# ===============================================================
 
-    try:
-        if input_file:
-            primary_path = f"gs://{gcs_bucket}/{input_file}"
-        else:
-            primary_path = f"gs://{gcs_bucket}/source/{source}/*.parquet"
+def impossible_login(okta_df, app_df):
+    okta = okta_df.withColumn("okta_ts", to_timestamp("ts"))
+    app  = app_df.withColumn("app_ts", to_timestamp("ts"))
 
-        logger.info(f"Reading primary input: {primary_path}")
-        primary = safe_read_parquet(spark, primary_path)
-
-        sources = {
-            "okta": safe_read_parquet(spark, f"gs://{gcs_bucket}/source/okta/*.parquet"),
-            "ad": safe_read_parquet(spark, f"gs://{gcs_bucket}/source/ad/*.parquet"),
-            "saviynt": safe_read_parquet(spark, f"gs://{gcs_bucket}/source/saviynt/*.parquet"),
-            "app_usage": safe_read_parquet(spark, f"gs://{gcs_bucket}/source/app_usage/*.parquet"),
-        }
-
-        okta_df = primary if source == "okta" else sources["okta"]
-        ad_df = primary if source == "ad" else sources["ad"]
-        sav_df = primary if source == "saviynt" else sources["saviynt"]
-        app_df = primary if source == "app_usage" else sources["app_usage"]
-
-        impossible_df = impossible_login(okta_df, app_df)
-        mfa_df = mfa_bypass_detection(okta_df, app_df)
-        shadow_df = detect_shadow_access(okta_df, app_df, sav_df, ad_df)
-        risk_df = compute_security_reputation(okta_df, sav_df, ad_df, app_df)
-        timeline_df = time_identity_portrait(okta_df, sav_df, ad_df, app_df)
-
-        write_bq(impossible_df, TABLES["impossible"], bq_project, bq_dataset, write_method)
-        write_bq(mfa_df, TABLES["mfa"], bq_project, bq_dataset, write_method)
-        write_bq(shadow_df, TABLES["shadow"], bq_project, bq_dataset, write_method)
-        write_bq(risk_df, TABLES["risk"], bq_project, bq_dataset, write_method)
-        write_bq(timeline_df, TABLES["timeline"], bq_project, bq_dataset, write_method)
-
-    except Exception:
-        logger.error("Spark job failed", exc_info=True)
-        sys.exit(1)
-    finally:
-        spark.stop()
-        logger.info("Spark session stopped")
-
-# -------------------------------------------------------------------
-# ENTRYPOINT
-# -------------------------------------------------------------------
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--env", required=True)
-    p.add_argument("--gcs_bucket", required=True)
-    p.add_argument("--bq_project", required=True)
-    p.add_argument("--bq_dataset", required=True)
-    p.add_argument("--source", required=True)
-    p.add_argument("--input_file", default=None)
-    p.add_argument("--write_method", default="direct")
-    p.add_argument("--temp_gcs_bucket", default=None)
-
-    args = p.parse_args()
-
-    main(
-        env=args.env,
-        gcs_bucket=args.gcs_bucket,
-        bq_project=args.bq_project,
-        bq_dataset=args.bq_dataset,
-        source=args.source,
-        input_file=args.input_file,
-        write_method=args.write_method,
-        temp_gcs_bucket=args.temp_gcs_bucket,
+    joined = (
+        okta.join(app, "user")
+        .withColumn("delta_sec", unix_timestamp("app_ts") - unix_timestamp("okta_ts"))
+        .filter((col("delta_sec") < 0) | (col("delta_sec") > 1800))
     )
+
+    return joined.select("user", "app", "okta_ts", "app_ts", "delta_sec")
+
+
+def mfa_bypass_detection(okta_df, app_df):
+    failed = okta_df.filter(col("status").like("%FAIL%")) \
+        .withColumn("fail_ts", to_timestamp("ts"))
+
+    app = app_df.withColumn("app_ts", to_timestamp("ts"))
+
+    return (
+        failed.join(app, "user")
+        .withColumn("delta_sec", unix_timestamp("app_ts") - unix_timestamp("fail_ts"))
+        .filter((col("delta_sec") > 0) & (col("delta_sec") <= 3600))
+        .select("user", "app", "fail_ts", "app_ts", "delta_sec")
+    )
+
+
+def mfa_bypass_detection_all_apps(okta_df, app_df):
+    return mfa_bypass_detection(okta_df, app_df)
+
+
+def impossible_travel(okta_df, app_df):
+    w = Window.partitionBy("user").orderBy("ts")
+    enriched = (
+        okta_df
+        .withColumn("ts", to_timestamp("ts"))
+        .withColumn("prev_ts", lag("ts").over(w))
+        .withColumn("delta_sec", unix_timestamp("ts") - unix_timestamp("prev_ts"))
+        .filter((col("country").isNotNull()) & (col("delta_sec") <= 3600))
+    )
+
+    return enriched
+
+
+def detect_shadow_access(okta_df, app_df, sav_df, ad_df):
+    ad = ad_df.withColumn("ad_ts", to_timestamp("ts"))
+    sav = sav_df.withColumn("sav_ts", to_timestamp("ts"))
+
+    ad_shadow = ad.join(
+        sav,
+        (ad.user == sav.user) & (ad.request_id == sav.req_id),
+        "left_anti"
+    )
+
+    return ad_shadow
+
+
+def privelege_escalation_without_request(ad_df, sav_df):
+    ad = ad_df.withColumn("ad_ts", to_timestamp("ts"))
+    sav = sav_df.withColumn("sav_ts", to_timestamp("ts"))
+
+    return ad.join(
+        sav,
+        (ad.user == sav.user) & (ad.request_id == sav.req_id),
+        "left_anti"
+    )
+
+
+def volume_spike_detection(ad_df):
+    ad = ad_df.withColumn("ts", to_timestamp("ts"))
+    daily = ad.groupBy(to_date("ts").alias("date"), "action").count()
+
+    w = Window.partitionBy("action").orderBy("date").rowsBetween(-7, -1)
+    return daily.withColumn("rolling_avg", avg("count").over(w)) \
+                .filter(col("count") > col("rolling_avg") * 3)
+
+
+def rejected_but_executed(ad_df, sav_df):
+    ad = ad_df.withColumn("ad_ts", to_timestamp("ts"))
+    sav = sav_df.withColumn("sav_ts", to_timestamp("ts"))
+
+    return ad.join(
+        sav,
+        (ad.user == sav.user) & (ad.request_id == sav.req_id) &
+        (sav.status.isin("REJECTED", "DENIED")),
+        "inner"
+    )
+
+
+def high_risk_sequence_analysis(app_df):
+    w = Window.partitionBy("user").orderBy("ts")
+    app = app_df.withColumn("prev_app", lag("app").over(w)) \
+                .withColumn("next_app", lead("app").over(w))
+
+    return app.filter(
+        (col("prev_app") == "GitHub") &
+        (col("app") == "Snowflake") &
+        (col("next_app") == "Databricks")
+    )
+
+
+def excessive_data_transferred(app_df):
+    app = app_df.withColumn("date", to_date("ts"))
+    daily = app.groupBy("user", "date").agg(sum("data_mb").alias("total_mb"))
+
+    w = Window.partitionBy("user").orderBy("date").rowsBetween(-7, -1)
+    return daily.withColumn("avg_mb", avg("total_mb").over(w)) \
+                .filter(col("total_mb") > col("avg_mb") * 3)
+
+
+def first_seen_last_seen_role(sav_df):
+    return sav_df.groupBy("user").agg(
+        first("role").alias("first_role"),
+        last("role").alias("last_role")
+    )
+
+
+def stale_access_detection(app_df, sav_df):
+    sav = sav_df.withColumn("sav_ts", to_timestamp("ts"))
+    return sav.filter(
+        unix_timestamp(current_timestamp()) - unix_timestamp("sav_ts") > 45 * 86400
+    )
+
+
+def multi_app_single_session(app_df, okta_df):
+    return (
+        app_df.groupBy("user", "session_id")
+        .agg(countDistinct("app").alias("app_count"))
+        .filter(col("app_count") > 4)
+    )
+
+
+def mfa_drift(okta_df, app_df):
+    return okta_df.groupBy("user", "mfa").count()
+
+
+def suspicious_approver_behavior(sav_df):
+    return sav_df.groupBy("approver").count().filter(col("count") > 25)
+
+
+def ad_group_churn_rate(ad_df):
+    ad = ad_df.withColumn("date", to_date("ts"))
+    return ad.groupBy("user").count()
+
+
+def orphan_event_detection(okta_df, sav_df, ad_df, app_df):
+    return app_df.join(okta_df, "user", "left_anti")
+
+
+def orphan_user_detection(okta_df, sav_df, ad_df, app_df):
+    return app_df.join(okta_df, "user", "left_anti")
+
+
+def find_cleanest_users(okta_df, sav_df, ad_df, app_df):
+    return okta_df.groupBy("user").count().orderBy("count").limit(10)
+
+
+def compute_security_reputation(okta_df, sav_df, ad_df, app_df):
+    return okta_df.groupBy("user").agg(count("*").alias("risk_score"))
+
+
+def time_identity_portriat(okta_df, sav_df, ad_df, app_df):
+    return (
+        okta_df.select("user", "ts")
+        .union(sav_df.select("user", "ts"))
+        .union(ad_df.select("user", "ts"))
+        .union(app_df.select("user", "ts"))
+    )
+
+
+def suspicious_cross_system_time_warp(sav_df, ad_df, app_df):
+    return sav_df.join(ad_df, "user").join(app_df, "user")
+
+
+# ===============================================================
+# MAIN
+# ===============================================================
+def main(env, gcs_bucket, bq_project, bq_dataset, source):
+
+    spark = SparkSession.builder.appName(f"IAM-{env}").getOrCreate()
+    base = f"gs://{gcs_bucket}/source"
+
+    okta_df = spark.read.parquet(f"{base}/okta/*.parquet")
+    ad_df   = spark.read.parquet(f"{base}/ad/*.parquet")
+    app_df  = spark.read.parquet(f"{base}/app_usage/*.parquet")
+    sav_df  = spark.read.parquet(f"{base}/saviynt/*.parquet")
+
+    detections = [
+        ("impossible_login_anomalies", impossible_login(okta_df, app_df)),
+        ("mfa_bypass_events", mfa_bypass_detection(okta_df, app_df)),
+        ("mfa_bypass_events_all_apps", mfa_bypass_detection_all_apps(okta_df, app_df)),
+        ("impossible_travel_events", impossible_travel(okta_df, app_df)),
+        ("shadow_access_events", detect_shadow_access(okta_df, app_df, sav_df, ad_df)),
+        ("privilege_escalation_without_request", privelege_escalation_without_request(ad_df, sav_df)),
+        ("ad_volume_spikes", volume_spike_detection(ad_df)),
+        ("rejected_but_executed", rejected_but_executed(ad_df, sav_df)),
+        ("high_risk_sequence", high_risk_sequence_analysis(app_df)),
+        ("excessive_data_transferred", excessive_data_transferred(app_df)),
+        ("role_drift", first_seen_last_seen_role(sav_df)),
+        ("stale_access", stale_access_detection(app_df, sav_df)),
+        ("multi_app_single_session", multi_app_single_session(app_df, okta_df)),
+        ("mfa_drift", mfa_drift(okta_df, app_df)),
+        ("suspicious_approver_behavior", suspicious_approver_behavior(sav_df)),
+        ("ad_group_churn_rate", ad_group_churn_rate(ad_df)),
+        ("orphan_event_detection", orphan_event_detection(okta_df, sav_df, ad_df, app_df)),
+        ("orphan_user_detection", orphan_user_detection(okta_df, sav_df, ad_df, app_df)),
+        ("cleanest_users", find_cleanest_users(okta_df, sav_df, ad_df, app_df)),
+        ("risk_scores", compute_security_reputation(okta_df, sav_df, ad_df, app_df)),
+        ("identity_timelines", time_identity_portriat(okta_df, sav_df, ad_df, app_df)),
+        ("suspicious_time_warp", suspicious_cross_system_time_warp(sav_df, ad_df, app_df)),
+    ]
+
+    for table, df in detections:
+        logger.info(f"🚀 Running detection → {table}")
+        write_bq(df, bq_project, bq_dataset, table)
+
+    spark.stop()
+
+
+# ===============================================================
+# ENTRYPOINT
+# ===============================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", required=True)
+    parser.add_argument("--gcs_bucket", required=True)
+    parser.add_argument("--bq_project", required=True)
+    parser.add_argument("--bq_dataset", required=True)
+    parser.add_argument("--source", required=True)
+
+    args = parser.parse_args()
+    main(**vars(args))
